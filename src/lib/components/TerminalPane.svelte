@@ -864,6 +864,20 @@
             if (core && typeof core._inputEvent === "function") {
                 const origInputEvent = core._inputEvent.bind(core);
                 core._inputEvent = function (ev: InputEvent): boolean {
+                    // Fail-open：访问的私有字段未来若被 xterm 改名/删除，立即回退到原版
+                    // _inputEvent，保证输入管道不被本 patch 炸断。
+                    try {
+                        if (
+                            !core.coreService ||
+                            typeof core.coreService.triggerDataEvent !== "function" ||
+                            !core.optionsService?.rawOptions ||
+                            typeof core.cancel !== "function"
+                        ) {
+                            return origInputEvent(ev);
+                        }
+                    } catch {
+                        return origInputEvent(ev);
+                    }
                     const ch = core._compositionHelper;
                     if (
                         ev.data &&
@@ -874,11 +888,15 @@
                     ) {
                         if (core._keyPressHandled) return false;
                         core._unprocessedDeadKey = false;
-                        core.coreService.triggerDataEvent(ev.data, true);
-                        // 清空 textarea：阻止 xterm 内部 _handleAnyTextareaChanges
-                        // 的 setTimeout 兜底再 emit 一次相同数据
-                        if (core.textarea) core.textarea.value = "";
-                        core.cancel(ev);
+                        try {
+                            core.coreService.triggerDataEvent(ev.data, true);
+                            // 清空 textarea：阻止 xterm 内部 _handleAnyTextareaChanges
+                            // 的 setTimeout 兜底再 emit 一次相同数据
+                            if (core.textarea) core.textarea.value = "";
+                            core.cancel(ev);
+                        } catch {
+                            return origInputEvent(ev);
+                        }
                         return true;
                     }
                     return origInputEvent(ev);
