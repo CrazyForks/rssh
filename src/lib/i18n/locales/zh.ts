@@ -723,6 +723,7 @@ const zh: Messages = {
   "settings.shell.copy_on_select": "选中即复制",
   "settings.shell.copy_on_select_desc": "选中文本时自动复制到剪贴板。",
   "settings.shell.right_click": "右键动作",
+  "settings.shell.right_click_desc": "右键终端时执行的动作。",
   "settings.shell.right_click_menu": "系统菜单（默认）",
   "settings.shell.right_click_paste": "粘贴",
   "settings.shell.right_click_copy_paste": "有选区则复制，否则粘贴",

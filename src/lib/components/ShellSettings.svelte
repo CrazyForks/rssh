@@ -186,22 +186,32 @@
   </div>
 
   <div class="section-label">{t("settings.shell.mouse")}</div>
-  <div class="switch-card">
-    <div class="switch-card-body">
-      <div class="switch-card-title" class:on={copyOnSelect} class:off={!copyOnSelect}>{t("settings.shell.copy_on_select")}</div>
-      <div class="switch-card-desc">{t("settings.shell.copy_on_select_desc")}</div>
+  <!-- 鼠标交互：选中即复制（开关）+ 右键动作（下拉）合在一张卡片，
+       "主行 + 分隔线 + 次行"结构，跟命令块卡片同款，避免两个控件割裂。 -->
+  <div class="card surface-raised mouse-card">
+    <div class="cmd-block-head">
+      <div class="cmd-block-head-body">
+        <div class="cmd-block-title" class:on={copyOnSelect} class:off={!copyOnSelect}>{t("settings.shell.copy_on_select")}</div>
+        <div class="cmd-block-desc">{t("settings.shell.copy_on_select_desc")}</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" bind:checked={copyOnSelect} onchange={saveCopyOnSelect} />
+        <span class="slider"></span>
+      </label>
     </div>
-    <label class="switch">
-      <input type="checkbox" bind:checked={copyOnSelect} onchange={saveCopyOnSelect} />
-      <span class="slider"></span>
-    </label>
-  </div>
-  <div class="rca-row">
-    <label for="rca-select" class="rca-label">{t("settings.shell.right_click")}</label>
-    <div class="rca-select">
-      <Select id="rca-select" bind:value={rightClickAction}
-              options={rightClickOptions}
-              onchange={(v) => saveRightClickAction(v as app.RightClickAction)} />
+
+    <div class="card-divider"></div>
+
+    <div class="cmd-block-head">
+      <div class="cmd-block-head-body">
+        <label for="rca-select" class="cmd-block-title">{t("settings.shell.right_click")}</label>
+        <div class="cmd-block-desc">{t("settings.shell.right_click_desc")}</div>
+      </div>
+      <div class="rca-select">
+        <Select id="rca-select" bind:value={rightClickAction}
+                options={rightClickOptions}
+                onchange={(v) => saveRightClickAction(v as app.RightClickAction)} />
+      </div>
     </div>
   </div>
 
@@ -246,7 +256,8 @@
   /* 卡片：复用全局 .card.surface-raised，本地只加 padding + 内布局，
      跟 GitHubSyncScreen / AiSettings 同款。 */
   .shell-card,
-  .cmd-block-card {
+  .cmd-block-card,
+  .mouse-card {
     padding: 18px;
     display: flex;
     flex-direction: column;
@@ -397,14 +408,8 @@
     width: 80px;
   }
 
-  /* 右键动作选择行：label 左、Select 右，定宽避免 Select 撑满整行。 */
-  .rca-row {
-    display: flex; align-items: center; gap: 12px;
-  }
-  .rca-label {
-    font-size: 13px; color: var(--text);
-  }
-  .rca-select { width: 260px; }
+  /* 右键动作的下拉框：定宽，靠右，不被卡片行压缩。 */
+  .rca-select { width: 260px; flex-shrink: 0; }
   .timeout-hint {
     font-size: 11px; color: var(--text-dim);
   }

@@ -721,6 +721,7 @@ const en = {
   "settings.shell.copy_on_select": "Copy on select",
   "settings.shell.copy_on_select_desc": "Automatically copy selected text to the clipboard.",
   "settings.shell.right_click": "Right-click action",
+  "settings.shell.right_click_desc": "What right-clicking the terminal does.",
   "settings.shell.right_click_menu": "System menu (default)",
   "settings.shell.right_click_paste": "Paste",
   "settings.shell.right_click_copy_paste": "Copy if selected, otherwise paste",
