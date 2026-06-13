@@ -1,11 +1,11 @@
-//! `rssh config <export|import|set|push|pull>` —— 配置备份与 GitHub 同步。
+//! `rssh config <export|import|set|push|pull>` —— config backup & GitHub sync.
 //!
-//! `import` 走增量合并（merge_import），`pull` 走全量替换 + 事务（replace_import），
-//! 共用 `rssh_lib::sync::config` —— GUI 同一份逻辑。
+//! Both `import` and `pull` go through `merge_import` (additive upsert by
+//! identity, never destructive), sharing `rssh_lib::sync::config` with the GUI.
 
 use clap::Subcommand;
 use rssh_lib::error::{AppError, AppResult};
-use rssh_lib::secret::{cred_secret_key, setting_key, SecretStore};
+use rssh_lib::secret::{setting_key, SecretStore};
 
 use crate::ctx::CliCtx;
 use crate::helpers::{die, prompt_default, prompt_secret_default, read_password};
@@ -24,12 +24,6 @@ pub enum ConfigCmd {
     Pull,
 }
 
-#[derive(Clone, Copy)]
-enum ImportMode {
-    Merge,
-    Replace,
-}
-
 pub fn cmd_config(conn: &CliCtx, action: ConfigCmd) -> AppResult<()> {
     match action {
         ConfigCmd::Export { file } => config_export(conn, &file),
@@ -40,67 +34,26 @@ pub fn cmd_config(conn: &CliCtx, action: ConfigCmd) -> AppResult<()> {
     }
 }
 
-/// 构造 export / push 共用的 JSON 形态。
-///
-/// 形态必须**完整覆盖** GUI export 的字段集（profiles / credentials / forwards /
-/// groups / skills），否则 CLI 产出的 backup 在 GUI replace_pull 时会把缺失的
-/// 表清空。CLI ↔ GUI 互导互拉是默认场景，不能在格式上漂移。
-///
-/// `respect_save_to_remote = true`（push 路径）时把 `save_to_remote=false`
-/// 的凭证 secret 置 None；本地 export 路径传 false，所有 secret 都进加密文件。
-fn build_config_json(conn: &CliCtx, respect_save_to_remote: bool) -> AppResult<String> {
-    let profiles = rssh_lib::db::profile::list(conn)?;
-    let mut credentials = rssh_lib::db::credential::list(conn)?;
-    for c in credentials.iter_mut() {
-        c.secret = conn.secret_store().get(&cred_secret_key(&c.id))?;
-        if respect_save_to_remote && !c.save_to_remote {
-            c.secret = None;
-        }
-    }
-    let forwards = rssh_lib::db::forward::list(conn)?;
-    let serial_profiles = rssh_lib::db::serial_profile::list(conn)?;
-    let groups = rssh_lib::db::group::list(conn)?;
-    // ai_skill 表只有 user 自定义条目，builtin "general" 不入表。
-    // SkillRecord wire format 需要 builtin 字段，inline 拼出来避免依赖 ai 模块。
-    let skills: Vec<serde_json::Value> = rssh_lib::db::ai_skill::list(conn)?
-        .into_iter()
-        .map(|u| {
-            serde_json::json!({
-                "id": u.id,
-                "name": u.name,
-                "description": u.description,
-                "content": u.content,
-                "builtin": false,
-            })
-        })
-        .collect();
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
-        "version": 1,
-        "exported_at": chrono::Utc::now().to_rfc3339(),
-        "profiles": profiles,
-        "credentials": credentials,
-        "forwards": forwards,
-        "serial_profiles": serial_profiles,
-        "groups": groups,
-        "skills": skills,
-    }))
-    .unwrap_or_else(|e| die(format!("Serialization failed: {e}"))))
-}
-
-/// 解析 JSON 后委派给共享同步逻辑。CLI 与 GUI 共用 sync::config 这一份。
-fn import_config_json(conn: &CliCtx, json: &str, mode: ImportMode) -> AppResult<()> {
+/// Parse JSON then delegate to the shared sync logic (same path as the GUI).
+fn import_config_json(conn: &CliCtx, json: &str) -> AppResult<()> {
     let data: serde_json::Value =
         serde_json::from_str(json).unwrap_or_else(|e| die(format!("JSON parse error: {e}")));
     let ss: &dyn SecretStore = conn.secret_store().as_ref();
-    match mode {
-        ImportMode::Merge => rssh_lib::sync::config::merge_import(conn, ss, &data),
-        ImportMode::Replace => rssh_lib::sync::config::replace_import(conn, ss, &data),
-    }
+    rssh_lib::sync::config::merge_import(conn, ss, &conn.data_dir, &data)
 }
 
 fn config_export(conn: &CliCtx, file: &str) -> AppResult<()> {
-    // 本地 export：所有 secret 都加密落盘，不看 save_to_remote。
-    let json = build_config_json(conn, false)?;
+    // 本地 export：全量备份（每个类别 + 所有 secret），不看开关 —— 跟 GUI 本地导出
+    // 用同一个 build_payload，CLI ↔ GUI 形态永不漂移。
+    let ss: &dyn SecretStore = conn.secret_store().as_ref();
+    let payload = rssh_lib::sync::config::build_payload(
+        conn,
+        ss,
+        &conn.data_dir,
+        &rssh_lib::sync::config::ExportMode::LocalBackup,
+    )?;
+    let json = serde_json::to_string_pretty(&payload)
+        .unwrap_or_else(|e| die(format!("Serialization failed: {e}")));
     let pw = read_password("Encryption password: ");
     let pw2 = read_password("Confirm password: ");
     if pw != pw2 {
@@ -119,8 +72,8 @@ fn config_import(conn: &CliCtx, file: &str) -> AppResult<()> {
     let encrypted = std::fs::read_to_string(file)?;
     let pw = read_password("Decryption password: ");
     let json = rssh_lib::crypto::decrypt(&encrypted, &pw)?;
-    // 文件 import：增量合并，本地数据保留；同 id 实体被覆盖。
-    import_config_json(conn, &json, ImportMode::Merge)?;
+    // File import: additive merge — local data kept; same-id entities overwritten.
+    import_config_json(conn, &json)?;
     println!("Imported from {file}");
     Ok(())
 }
@@ -163,8 +116,18 @@ fn config_push(conn: &CliCtx) -> AppResult<()> {
         .unwrap_or_else(|| die("GitHub repo not set"));
     let branch = rssh_lib::db::settings::get(conn, "github_branch")?.unwrap_or("main".into());
 
-    // push 路径：尊重 save_to_remote — 不同步的凭证 secret 置 None。
-    let mut json_data = build_config_json(conn, true)?;
+    // push 路径：跟 GUI push 用同一个 build_payload —— 尊重所有同步开关 + group 过滤
+    // + save_to_remote scrub + AI-key 闸门。GUI 里关掉的类别，CLI 也不会漏到同一 repo。
+    let ss: &dyn SecretStore = conn.secret_store().as_ref();
+    let prefs = rssh_lib::sync::config::read_sync_prefs(conn)?;
+    let payload = rssh_lib::sync::config::build_payload(
+        conn,
+        ss,
+        &conn.data_dir,
+        &rssh_lib::sync::config::ExportMode::GitHubPush(prefs),
+    )?;
+    let mut json_data = serde_json::to_string_pretty(&payload)
+        .unwrap_or_else(|e| die(format!("Serialization failed: {e}")));
 
     let pw = read_password("Encryption password: ");
     let encrypted = rssh_lib::crypto::encrypt(&json_data, &pw)?;
@@ -198,8 +161,8 @@ fn config_pull(conn: &CliCtx) -> AppResult<()> {
 
     let pw = read_password("Decryption password: ");
     let json = rssh_lib::crypto::decrypt(&encrypted, &pw)?;
-    // pull：全量替换语义，clear+insert 包事务。
-    import_config_json(conn, &json, ImportMode::Replace)?;
+    // pull: additive merge (no destructive clear) — same as the GUI.
+    import_config_json(conn, &json)?;
     println!("Pulled from GitHub.");
     Ok(())
 }
