@@ -174,8 +174,14 @@ pub struct Group {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HighlightRule {
     pub keyword: String,
+    #[serde(default)]
+    pub name: String,
     pub color: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub is_regex: bool,
+    #[serde(default)]
+    pub is_case_sensitive: bool,
 }
 
 // --- Snippet ---

@@ -1,8 +1,13 @@
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 use crate::error::AppResult;
 
-const SCHEMA_VERSION: u32 = 17;
+const SCHEMA_VERSION: u32 = 19;
+
+fn column_exists(conn: &Connection, table: &str, col: &str) -> AppResult<bool> {
+    let mut stmt = conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?;
+    Ok(stmt.exists([table, col])?)
+}
 
 pub fn migrate(conn: &Connection) -> AppResult<()> {
     let version: u32 = conn
@@ -281,6 +286,42 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
                 ON ai_conversations(target_key, updated_at);
             ",
         )?;
+    }
+
+    if version < 18 {
+        // Keyword highlighting now supports regex and case-sensitive toggles.
+        // Default 0 preserves existing rule behavior: plain text, case-insensitive.
+        if !column_exists(conn, "highlights", "is_regex")? {
+            conn.execute_batch(
+                "ALTER TABLE highlights ADD COLUMN is_regex INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        if !column_exists(conn, "highlights", "is_case_sensitive")? {
+            conn.execute_batch(
+                "ALTER TABLE highlights ADD COLUMN is_case_sensitive INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+    }
+
+    if version < 19 {
+        // Regex highlight rules support a human-readable name for easier list management.
+        if !column_exists(conn, "highlights", "name")? {
+            conn.execute_batch(
+                "ALTER TABLE highlights ADD COLUMN name TEXT NOT NULL DEFAULT '';",
+            )?;
+        }
+        let ipv4_pattern = r"\b(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}\b";
+        let exists: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM highlights WHERE keyword = ?1",
+            params![ipv4_pattern],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            conn.execute(
+                "INSERT INTO highlights (keyword, name, color, enabled, is_regex, is_case_sensitive) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![ipv4_pattern, "IPv4", "#D86BFF", 1, 1, 0],
+            )?;
+        }
     }
 
     if version < SCHEMA_VERSION {
