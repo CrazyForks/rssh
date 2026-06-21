@@ -2,7 +2,7 @@ use rusqlite::{params, Connection};
 
 use crate::error::AppResult;
 
-const SCHEMA_VERSION: u32 = 19;
+const SCHEMA_VERSION: u32 = 20;
 
 fn column_exists(conn: &Connection, table: &str, col: &str) -> AppResult<bool> {
     let mut stmt = conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?;
@@ -321,6 +321,18 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
                 "INSERT INTO highlights (keyword, name, color, enabled, is_regex, is_case_sensitive) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![ipv4_pattern, "IPv4", "#D86BFF", 1, 1, 0],
             )?;
+        }
+    }
+
+    if version < 20 {
+        // group_id on forwards / serial_profiles. They become peers of profiles
+        // (v10) under the shared `groups` table. ADD COLUMN DEFAULT NULL → every
+        // existing row is "ungrouped"; zero breakage. Mirrors v10's profiles add.
+        if !column_exists(conn, "forwards", "group_id")? {
+            conn.execute_batch("ALTER TABLE forwards ADD COLUMN group_id TEXT DEFAULT NULL;")?;
+        }
+        if !column_exists(conn, "serial_profiles", "group_id")? {
+            conn.execute_batch("ALTER TABLE serial_profiles ADD COLUMN group_id TEXT DEFAULT NULL;")?;
         }
     }
 

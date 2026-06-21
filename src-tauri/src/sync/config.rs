@@ -361,18 +361,15 @@ fn parse_skill(item: &Value) -> AppResult<Option<crate::db::ai_skill::UserSkill>
 /// "sync everything" behavior; the user opts OUT per category.
 #[derive(Debug)]
 pub struct SyncPrefs {
-    credentials: bool,
-    forwards: bool,
-    groups: bool,
-    serial: bool,
     skills: bool,
     highlights: bool,
     snippets: bool,
     ai_redact: bool,
     ai_blacklist: bool,
     ai: bool,
-    ai_key: bool,
-    /// `None` = all profiles; `Some(ids)` = only profiles in those groups.
+    /// Group filter shared by profiles / forwards / serial_profiles.
+    /// `None` = everything (the "all groups" sentinel). `Some(ids)` = only rows
+    /// whose group is in the set; the "" id matches ungrouped rows.
     profile_group_ids: Option<Vec<String>>,
 }
 
@@ -406,23 +403,37 @@ pub fn read_sync_prefs(db: &Db) -> AppResult<SyncPrefs> {
         _ => None,
     };
     Ok(SyncPrefs {
-        credentials: flag("sync_include_credentials")?,
-        forwards: flag("sync_include_forwards")?,
-        groups: flag("sync_include_groups")?,
-        serial: flag("sync_include_serial")?,
         skills: flag("sync_include_skills")?,
         highlights: flag("sync_include_highlights")?,
         ai_redact: flag("sync_include_ai_redact")?,
         ai_blacklist: flag("sync_include_ai_blacklist")?,
         snippets: flag("sync_include_snippets")?,
         ai: flag("sync_include_ai")?,
-        ai_key: flag("sync_include_ai_key")?,
         profile_group_ids,
     })
 }
 
 fn to_val<T: serde::Serialize>(v: T) -> AppResult<Value> {
     serde_json::to_value(v).map_err(|e| AppError::other("serde_failed", json!({ "err": e.to_string() })))
+}
+
+/// Apply the push-time group filter to any grouped category. `None` prefs (local
+/// backup) or a `None` group filter (the "all groups" sentinel) keep everything;
+/// `Some(ids)` retains only rows whose group is in the set — ungrouped rows
+/// (group_id = None) drop out, exactly like profiles. Shared by profiles /
+/// forwards / serial_profiles so the three filters can't drift apart.
+fn retain_by_groups<T>(
+    items: &mut Vec<T>,
+    prefs: Option<&SyncPrefs>,
+    group_of: impl Fn(&T) -> Option<&str>,
+) {
+    let Some(gids) = prefs.and_then(|p| p.profile_group_ids.as_ref()) else {
+        return;
+    };
+    let set: std::collections::HashSet<&str> = gids.iter().map(String::as_str).collect();
+    // An ungrouped row (group_id = None) keys to "" — selecting the "" sentinel
+    // (the UI's "Ungrouped" chip) includes it. A real group id is never empty.
+    items.retain(|it| set.contains(group_of(it).unwrap_or("")));
 }
 
 fn collect_credentials_with_secrets(
@@ -457,34 +468,34 @@ pub fn build_payload(
     out.insert("version".into(), json!(1));
     out.insert("exported_at".into(), json!(chrono::Utc::now().to_rfc3339()));
 
-    // profiles — always present, filtered to the selected groups on push.
+    // profiles / forwards / serial_profiles — always present, filtered to the
+    // selected groups on push. The forwards/serial per-category opt-out toggles
+    // were removed: "sync everything" is now expressed as "select all groups".
     let mut profiles = profile::list(db)?;
-    if let Some(gids) = prefs.and_then(|p| p.profile_group_ids.as_ref()) {
-        let set: std::collections::HashSet<&str> = gids.iter().map(String::as_str).collect();
-        profiles.retain(|pr| pr.group_id.as_deref().is_some_and(|g| set.contains(g)));
-    }
+    retain_by_groups(&mut profiles, prefs, |p| p.group_id.as_deref());
     out.insert("profiles".into(), to_val(profiles)?);
 
-    if on(|p| p.credentials) {
-        let mut credentials = collect_credentials_with_secrets(db, ss)?;
-        if prefs.is_some() {
-            for c in credentials.iter_mut() {
-                if !c.save_to_remote {
-                    c.secret = None;
-                }
+    // credentials + groups are the referential closure of the always-exported
+    // profiles/forwards/serial (profile→credential_id, *→group_id). Gating them
+    // behind their own toggle would leave dangling refs on the other device, so
+    // both always ride along. Secret upload stays gated per-credential by
+    // save_to_remote — orthogonal to (and unaffected by) the removed toggle.
+    let mut credentials = collect_credentials_with_secrets(db, ss)?;
+    if prefs.is_some() {
+        for c in credentials.iter_mut() {
+            if !c.save_to_remote {
+                c.secret = None;
             }
         }
-        out.insert("credentials".into(), to_val(credentials)?);
     }
-    if on(|p| p.forwards) {
-        out.insert("forwards".into(), to_val(forward::list(db)?)?);
-    }
-    if on(|p| p.groups) {
-        out.insert("groups".into(), to_val(group::list(db)?)?);
-    }
-    if on(|p| p.serial) {
-        out.insert("serial_profiles".into(), to_val(serial_profile::list(db)?)?);
-    }
+    out.insert("credentials".into(), to_val(credentials)?);
+    let mut forwards = forward::list(db)?;
+    retain_by_groups(&mut forwards, prefs, |f| f.group_id.as_deref());
+    out.insert("forwards".into(), to_val(forwards)?);
+    out.insert("groups".into(), to_val(group::list(db)?)?);
+    let mut serials = serial_profile::list(db)?;
+    retain_by_groups(&mut serials, prefs, |s| s.group_id.as_deref());
+    out.insert("serial_profiles".into(), to_val(serials)?);
     if on(|p| p.skills) {
         out.insert("skills".into(), to_val(crate::ai::skills::list_user(db)?)?);
     }
@@ -503,11 +514,14 @@ pub fn build_payload(
             to_val(ai_command_blacklist::list(db)?)?,
         );
     }
+    // "AI 配置" — one toggle for the whole AI section: active provider + each
+    // provider's model/endpoint AND api_key, all-or-nothing. The key rides in the
+    // payload as plaintext, then the whole payload is encrypted with the sync
+    // password before upload, so the remote never sees it in clear.
     if on(|p| p.ai) {
-        let include_keys = on(|p| p.ai_key);
         out.insert(
             "ai".into(),
-            crate::ai::commands::export_ai_settings(db, ss, include_keys)?,
+            crate::ai::commands::export_ai_settings(db, ss, true)?,
         );
     }
 
@@ -595,6 +609,7 @@ mod tests {
             input_mode: "normal".into(),
             output_mode: "text".into(),
             login_script: String::new(),
+            group_id: None,
         }
     }
 
