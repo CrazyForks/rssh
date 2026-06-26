@@ -5,6 +5,7 @@
 **The SSH client built to be an AI ops copilot.**
 
 > Connect to a host and just ask "why is the disk full?" — the AI proposes commands, flags their side effects, and runs them in your terminal only after you approve. Sensitive data is redacted locally before anything leaves your machine.
+> 
 > Desktop · Mobile · JetBrains · CLI — one shared data store.
 
 [![Release](https://img.shields.io/github/v/release/shihuili1218/rssh)](https://github.com/shihuili1218/rssh/releases/latest)
@@ -23,7 +24,7 @@
 
 ## Why RSSH
 
-### 🤖 AI triage, with you always in the loop
+### 🤖 AI triage
 Not another chat box. It reads what is **actually happening** in your terminal, proposes **read-first** commands, each annotated with its side effects and gated behind an explicit "Run" click. Before any payload leaves your machine it passes a shape validator and local redaction — your keys and internal addresses never go out verbatim.
 
 ![AI triage panel: the AI proposes commands and waits for your approval](docs/welcome-ai.gif)
@@ -94,3 +95,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 ## License
 
 MIT
+
+## Friend Link
+
+- [LINUX DO](https://linux.do/)

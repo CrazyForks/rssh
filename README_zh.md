@@ -5,6 +5,7 @@
 **为 AI 运维而生的 SSH 客户端。**
 
 > 连上服务器，直接问"磁盘怎么满了"——AI 提议命令、标注副作用，你点同意它才在终端里执行；敏感信息离机前本地脱敏。
+> 
 > 桌面 · 手机 · JetBrains · 命令行，一套数据通用。
 
 [![Release](https://img.shields.io/github/v/release/shihuili1218/rssh)](https://github.com/shihuili1218/rssh/releases/latest)
@@ -23,7 +24,7 @@
 
 ## 为什么选 RSSH
 
-### 🤖 AI 排障，你始终在回路里
+### 🤖 AI 排障
 不是又一个聊天框。它读终端里**真实发生**的事，提议**只读优先**的命令，每条都标注副作用、要你点「执行」才会跑。payload 离机前过 shape 校验 + 本地脱敏——你的密钥、内网地址不会原样发出去。
 
 ![AI 排障面板：AI 提议命令，等你批准](docs/welcome-ai.gif)
@@ -92,3 +93,7 @@
 ## 协议
 
 MIT
+
+## 友情链接
+
+- [LINUX DO - 新的理想型社区](https://linux.do/)
