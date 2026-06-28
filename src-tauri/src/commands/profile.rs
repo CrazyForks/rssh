@@ -105,6 +105,32 @@ pub fn read_ssh_config_default() -> AppResult<Vec<SshConfigEntry>> {
     Ok(crate::ssh::config::parse(&content))
 }
 
+/// 允许快速填充的默认私钥名。webview 是不可信边界——用白名单而非黑名单：
+/// 只放行这两个，`~/.ssh` 下的 config / known_hosts / 其它私钥一概读不到。
+/// 与前端 `CredentialEditor.svelte` 的 DEFAULT_KEY_NAMES 保持一致。
+const ALLOWED_DEFAULT_KEYS: &[&str] = &["id_rsa", "id_ed25519"];
+
+/// 读 `~/.ssh/<name>` 私钥文件原文，供"快速填充默认密钥"用。
+/// name 必须在 `ALLOWED_DEFAULT_KEYS` 白名单内，否则拒绝。
+/// 文件不存在 → not_found，让前端给友好提示而不是 IO 噪声。
+#[tauri::command]
+pub fn read_default_key_file(name: String) -> AppResult<String> {
+    if !ALLOWED_DEFAULT_KEYS.contains(&name.as_str()) {
+        return Err(AppError::other("invalid_key_name", json!({ "name": name })));
+    }
+    let home =
+        dirs::home_dir().ok_or_else(|| AppError::other("home_dir_unavailable", json!({})))?;
+    let path = home.join(".ssh").join(&name);
+    match std::fs::read_to_string(&path) {
+        Ok(c) => Ok(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(AppError::not_found(
+            "key_file_not_found",
+            json!({ "path": format!("~/.ssh/{name}") }),
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// 单条导入失败信息：哪个 host 的哪步出错。前端按表格展示。
 #[derive(Debug, Clone, Serialize)]
 pub struct SshImportError {
