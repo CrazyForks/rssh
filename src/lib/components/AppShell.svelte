@@ -21,7 +21,7 @@
     import ChatPanel from "../ai/ChatPanel.svelte";
     import * as ai from "../ai/store.svelte.ts";
     import type { AiTargetKind } from "../ai/types.ts";
-    import {attachShortcuts, attachKeyup, type Shortcut} from "../keyboard/registry.ts";
+    import {attachShortcuts, attachKeyup, digitTabIndex, type Shortcut} from "../keyboard/registry.ts";
     import {matchBinding, TAB_CYCLE} from "../keyboard/keymap.ts";
     import * as keymap from "../stores/keymap.svelte.ts";
     import {t, errMsg} from "../i18n/index.svelte.ts";
@@ -134,6 +134,25 @@
                     } else {
                         focusIdx = (focusIdx + dir + navItems.length) % navItems.length;
                     }
+                },
+            },
+            {
+                display: keymap.isMac ? "⌘1 … ⌘9" : "Alt+1 … Alt+9",
+                description: t("shortcut.tab.goto"),
+                // Direct jump to the Nth tab (1-based, by strip order). A fixed
+                // combo like Ctrl+Tab — kept out of the customizable ACTIONS
+                // editor since it is 9 combos, not one bindable action. Home
+                // (index 0) is skipped, so the combo lands on the first session
+                // tab. Cmd+1..9 on macOS, Alt+1..9 elsewhere — see digitTabIndex.
+                match: e => digitTabIndex(e, keymap.isMac) !== null,
+                handler: e => {
+                    // Don't hijack keys while the user is recording a new binding.
+                    if (keymap.recording()) return false;
+                    const idx = digitTabIndex(e, keymap.isMac);
+                    if (idx === null) return false;
+                    const tab = app.tabs()[idx];
+                    if (!tab) return false; // out of range: don't swallow the key
+                    app.setActiveTab(tab.id);
                 },
             },
             {
