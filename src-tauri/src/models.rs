@@ -219,20 +219,23 @@ pub enum ForwardType {
     Dynamic,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Forward {
-    pub id: String,
-    pub name: String,
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ForwardRule {
     #[serde(rename = "type")]
     pub forward_type: ForwardType,
     pub local_port: u16,
     pub remote_host: String,
     pub remote_port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Forward {
+    pub id: String,
+    pub name: String,
     pub profile_id: String,
     /// Optional group membership — shares the same `groups` table as profiles.
-    /// `#[serde(default)]` keeps older exported payloads (no group_id) importable.
-    #[serde(default)]
     pub group_id: Option<String>,
+    pub rules: Vec<ForwardRule>,
 }
 
 /// Saved serial console — a peer of `Profile`/`Forward`. No secret, no FK: just
@@ -635,5 +638,49 @@ mod tests {
         .unwrap();
 
         assert_eq!(p.algorithms, SshAlgorithms::default());
+    }
+
+    #[test]
+    fn forward_uses_rules_only_json_contract() {
+        let forward = Forward {
+            id: "f1".into(),
+            name: "database".into(),
+            profile_id: "p1".into(),
+            group_id: None,
+            rules: vec![ForwardRule {
+                forward_type: ForwardType::Local,
+                local_port: 8080,
+                remote_host: "db.internal".into(),
+                remote_port: 5432,
+            }],
+        };
+
+        let json = serde_json::to_value(&forward).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "id": "f1",
+                "name": "database",
+                "profile_id": "p1",
+                "group_id": null,
+                "rules": [{
+                    "type": "local",
+                    "local_port": 8080,
+                    "remote_host": "db.internal",
+                    "remote_port": 5432
+                }]
+            })
+        );
+
+        let legacy = serde_json::json!({
+            "id": "f1",
+            "name": "database",
+            "profile_id": "p1",
+            "type": "local",
+            "local_port": 8080,
+            "remote_host": "db.internal",
+            "remote_port": 5432
+        });
+        assert!(serde_json::from_value::<Forward>(legacy).is_err());
     }
 }

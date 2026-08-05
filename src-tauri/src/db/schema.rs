@@ -2,7 +2,7 @@ use rusqlite::{params, Connection};
 
 use crate::error::AppResult;
 
-const SCHEMA_VERSION: u32 = 24;
+const SCHEMA_VERSION: u32 = 25;
 
 fn column_exists(conn: &Connection, table: &str, col: &str) -> AppResult<bool> {
     let mut stmt = conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?;
@@ -56,11 +56,7 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
             CREATE TABLE IF NOT EXISTS forwards (
                 id           TEXT PRIMARY KEY,
                 name         TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                profile_id   TEXT NOT NULL,
-                type         TEXT NOT NULL DEFAULT 'local',
-                local_port   INTEGER NOT NULL,
-                remote_host  TEXT NOT NULL,
-                remote_port  INTEGER NOT NULL
+                profile_id   TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS highlights (
@@ -509,6 +505,43 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
         )?;
     }
 
+    if table_exists(conn, "forwards")? && (version < 25 || column_exists(conn, "forwards", "type")?)
+    {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS forward_rules (
+                 forward_id  TEXT NOT NULL,
+                 position    INTEGER NOT NULL,
+                 type        TEXT NOT NULL,
+                 local_port  INTEGER NOT NULL,
+                 remote_host TEXT NOT NULL,
+                 remote_port INTEGER NOT NULL,
+                 PRIMARY KEY (forward_id, position),
+                 FOREIGN KEY (forward_id) REFERENCES forwards(id) ON DELETE CASCADE
+             );
+             DROP TRIGGER IF EXISTS forwards_legacy_insert;
+             DROP TRIGGER IF EXISTS forwards_legacy_update;
+             DROP TRIGGER IF EXISTS forwards_legacy_delete;",
+        )?;
+
+        if column_exists(conn, "forwards", "type")? {
+            conn.execute_batch(
+                "INSERT INTO forward_rules
+                     (forward_id, position, type, local_port, remote_host, remote_port)
+                 SELECT id, 0, type, local_port, remote_host, remote_port
+                 FROM forwards
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM forward_rules WHERE forward_id = forwards.id
+                 );",
+            )?;
+        }
+
+        for column in ["type", "local_port", "remote_host", "remote_port"] {
+            if column_exists(conn, "forwards", column)? {
+                conn.execute_batch(&format!("ALTER TABLE forwards DROP COLUMN {column};"))?;
+            }
+        }
+    }
+
     if version < SCHEMA_VERSION {
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
@@ -519,6 +552,57 @@ pub fn migrate(conn: &Connection) -> AppResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_25_moves_existing_forward_to_rule_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE forwards (
+                 id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 profile_id TEXT NOT NULL,
+                 type TEXT NOT NULL,
+                 local_port INTEGER NOT NULL,
+                 remote_host TEXT NOT NULL,
+                 remote_port INTEGER NOT NULL,
+                 group_id TEXT
+             );
+             INSERT INTO forwards VALUES
+                 ('f1', 'db', 'p1', 'remote', 5432, 'localhost', 9000, NULL);",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 24u32).unwrap();
+
+        migrate(&conn).unwrap();
+
+        let rule: (String, u32, String, u32) = conn
+            .query_row(
+                "SELECT type, local_port, remote_host, remote_port FROM forward_rules WHERE forward_id = 'f1' AND position = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(rule, ("remote".into(), 5432, "localhost".into(), 9000));
+
+        let columns = conn
+            .prepare("SELECT name FROM pragma_table_info('forwards') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(columns, ["id", "name", "profile_id", "group_id"]);
+
+        let legacy_triggers: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'trigger' AND name LIKE 'forwards_legacy_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_triggers, 0);
+    }
 
     #[test]
     fn migration_21_escapes_plain_text_highlights() {

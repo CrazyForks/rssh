@@ -1,7 +1,7 @@
 //! `rssh <profile|credential|forward> add` —— 交互式新增。
 
 use rssh_lib::error::{AppError, AppResult};
-use rssh_lib::models::{Credential, CredentialType, Forward, ForwardType, Profile};
+use rssh_lib::models::{Credential, CredentialType, Forward, ForwardRule, ForwardType, Profile};
 
 use crate::ctx::CliCtx;
 use crate::helpers::{
@@ -105,26 +105,10 @@ pub fn cmd_add_credential(conn: &CliCtx) -> AppResult<()> {
 
 pub fn cmd_add_forward(conn: &CliCtx) -> AppResult<()> {
     let name = prompt("Name: ");
-
-    println!("Type:");
-    println!("  1 - local (-L)");
-    println!("  2 - remote (-R)");
-    println!("  3 - dynamic (-D, SOCKS5)");
-    let ft = match prompt_default("Type #", "1").as_str() {
-        "2" => ForwardType::Remote,
-        "3" => ForwardType::Dynamic,
-        _ => ForwardType::Local,
-    };
-
-    let local_port: u16 = prompt("Local port: ").parse().unwrap_or(0);
-    let (remote_host, remote_port) = if ft == ForwardType::Dynamic {
-        ("127.0.0.1".to_string(), 0u16)
-    } else {
-        (
-            prompt_default("Remote host", "127.0.0.1"),
-            prompt("Remote port: ").parse().unwrap_or(0),
-        )
-    };
+    let mut rules = vec![prompt_forward_rule(None)];
+    while confirm("Add another forwarding rule?", false) {
+        rules.push(prompt_forward_rule(None));
+    }
 
     let profiles = rssh_lib::db::profile::list(conn)?;
     if profiles.is_empty() {
@@ -149,14 +133,74 @@ pub fn cmd_add_forward(conn: &CliCtx) -> AppResult<()> {
     let f = Forward {
         id: uuid::Uuid::new_v4().to_string(),
         name,
-        forward_type: ft,
-        local_port,
-        remote_host,
-        remote_port,
         profile_id,
         group_id: None,
+        rules,
     };
     rssh_lib::db::forward::insert(conn, &f)?;
     println!("Forward '{}' created.", f.name);
     Ok(())
+}
+
+pub(crate) fn prompt_forward_rule(current: Option<&ForwardRule>) -> ForwardRule {
+    println!("Type:");
+    println!("  1 - local (-L)");
+    println!("  2 - remote (-R)");
+    println!("  3 - dynamic (-D, SOCKS5)");
+    let default_type = match current.map(|rule| rule.forward_type) {
+        Some(ForwardType::Remote) => "2",
+        Some(ForwardType::Dynamic) => "3",
+        _ => "1",
+    };
+    let forward_type = match prompt_default("Type #", default_type).as_str() {
+        "2" => ForwardType::Remote,
+        "3" => ForwardType::Dynamic,
+        _ => ForwardType::Local,
+    };
+    let same_type = current.is_some_and(|rule| rule.forward_type == forward_type);
+    let default_local_port = if same_type {
+        current.unwrap().local_port.to_string()
+    } else {
+        match forward_type {
+            ForwardType::Remote => "80".into(),
+            ForwardType::Dynamic => "1080".into(),
+            ForwardType::Local => "8080".into(),
+        }
+    };
+    let local_port = prompt_port("Local port", &default_local_port);
+    if forward_type == ForwardType::Dynamic {
+        return ForwardRule {
+            forward_type,
+            local_port,
+            remote_host: "127.0.0.1".into(),
+            remote_port: 0,
+        };
+    }
+
+    let default_host = current
+        .map(|rule| rule.remote_host.as_str())
+        .unwrap_or("127.0.0.1");
+    let default_remote_port = if same_type {
+        current.unwrap().remote_port.to_string()
+    } else if forward_type == ForwardType::Remote {
+        "8080".into()
+    } else {
+        "80".into()
+    };
+    ForwardRule {
+        forward_type,
+        local_port,
+        remote_host: prompt_default("Remote host", default_host),
+        remote_port: prompt_port("Remote port", &default_remote_port),
+    }
+}
+
+fn prompt_port(label: &str, default: &str) -> u16 {
+    loop {
+        let value = prompt_default(label, default);
+        match value.parse() {
+            Ok(port) => return port,
+            Err(_) => eprintln!("Invalid port '{value}'; enter a number from 0 to 65535."),
+        }
+    }
 }

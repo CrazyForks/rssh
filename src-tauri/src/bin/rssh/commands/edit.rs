@@ -3,6 +3,7 @@
 use rssh_lib::error::{AppError, AppResult};
 use rssh_lib::models::CredentialType;
 
+use crate::commands::add::prompt_forward_rule;
 use crate::ctx::CliCtx;
 use crate::helpers::{
     confirm, die, load_cred_secrets, prompt_default, read_multiline, read_password,
@@ -153,13 +154,19 @@ pub fn cmd_edit_forward(conn: &CliCtx, name: &str) -> AppResult<()> {
 
     let mut updated = f.clone();
     updated.name = prompt_default("Name", &f.name);
-    updated.local_port = prompt_default("Local port", &f.local_port.to_string())
-        .parse()
-        .unwrap_or(f.local_port);
-    updated.remote_host = prompt_default("Remote host", &f.remote_host);
-    updated.remote_port = prompt_default("Remote port", &f.remote_port.to_string())
-        .parse()
-        .unwrap_or(f.remote_port);
+    updated.rules.clear();
+    for (index, rule) in f.rules.iter().enumerate() {
+        println!("Rule {}:", index + 1);
+        if confirm("Keep this rule?", true) {
+            updated.rules.push(prompt_forward_rule(Some(rule)));
+        }
+    }
+    while updated.rules.is_empty() || confirm("Add another forwarding rule?", false) {
+        if updated.rules.is_empty() {
+            println!("A forward requires at least one rule.");
+        }
+        updated.rules.push(prompt_forward_rule(None));
+    }
 
     rssh_lib::db::forward::update(conn, &updated)?;
     println!("Forward '{}' updated.", updated.name);

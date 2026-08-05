@@ -679,12 +679,14 @@ mod tests {
         Forward {
             id: id.into(),
             name: format!("fwd-{id}"),
-            forward_type: ForwardType::Local,
-            local_port: 8080,
-            remote_host: "127.0.0.1".into(),
-            remote_port: 80,
             profile_id: "p".into(),
             group_id: group.map(String::from),
+            rules: vec![crate::models::ForwardRule {
+                forward_type: ForwardType::Local,
+                local_port: 8080,
+                remote_host: "127.0.0.1".into(),
+                remote_port: 80,
+            }],
         }
     }
 

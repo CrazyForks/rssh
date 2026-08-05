@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
-  import { errMsg } from "../i18n/index.svelte.ts";
+  import { t, errMsg } from "../i18n/index.svelte.ts";
+  import { toast } from "../stores/toast.svelte.ts";
+  import type { ForwardRule } from "../stores/app.svelte.ts";
 
   let { tabId, meta = {} }: {
     tabId: string;
@@ -14,7 +16,25 @@
   let bytesTx = $state(0);
   let bytesRx = $state(0);
   let connections = $state(0);
+  type RuleStatus = "starting" | "active" | "stopped" | "error" | "stopping_error";
+  type RuleStats = {
+    index: number;
+    rule: ForwardRule;
+    status: RuleStatus;
+    bytes_tx: number;
+    bytes_rx: number;
+    connections: number;
+    effective_port: number | null;
+    error: string | null;
+  };
+  type ForwardStats = { bytes_tx: number; bytes_rx: number; connections: number; connected: boolean; rules: RuleStats[] };
+  let rules = $state<RuleStats[]>([]);
+  let rulePending = $state<Record<number, boolean>>({});
+  let pollGeneration = 0;
   let pollTimer = 0;
+  let connectGeneration = 0;
+  let stopGeneration = 0;
+  let destroyed = false;
 
   function formatBytes(b: number): string {
     if (b < 1024) return `${b} B`;
@@ -25,14 +45,38 @@
 
   async function pollStats() {
     if (!activeId || status !== "active") return;
+    const id = activeId;
+    const generation = ++pollGeneration;
     try {
-      const s = await invoke<{ bytes_tx: number; bytes_rx: number; connections: number }>(
-        "forward_stats", { activeId }
+      const s = await invoke<ForwardStats>(
+        "forward_stats", { activeId: id }
       );
+      if (destroyed || activeId !== id || status !== "active" || generation !== pollGeneration) return;
       bytesTx = s.bytes_tx;
       bytesRx = s.bytes_rx;
       connections = s.connections;
-    } catch { /* forward may have stopped */ }
+      rules = s.rules;
+      errorMsg = "";
+      if (!s.connected) {
+        stopPolling();
+        try {
+          await invoke("forward_stop", { activeId: id });
+          if (destroyed || activeId !== id || generation !== pollGeneration) return;
+          activeId = null;
+          status = "error";
+          errorMsg = t("error.ssh_disconnected");
+        } catch (e: any) {
+          if (destroyed || activeId !== id || generation !== pollGeneration) return;
+          status = "error";
+          errorMsg = errMsg(e);
+        }
+      }
+    } catch (e: any) {
+      if (destroyed || activeId !== id || generation !== pollGeneration) return;
+      stopPolling();
+      status = "error";
+      errorMsg = errMsg(e);
+    }
   }
 
   function startPolling() {
@@ -47,124 +91,224 @@
   onMount(connect);
 
   async function connect() {
+    const generation = ++connectGeneration;
     status = "connecting";
     errorMsg = "";
     bytesTx = 0; bytesRx = 0; connections = 0;
     try {
-      activeId = await invoke<string>("forward_start", { forwardId: meta.forwardId });
+      if (activeId) {
+        await invoke("forward_stop", { activeId });
+        if (destroyed || generation !== connectGeneration) return;
+        activeId = null;
+      }
+      const startedId = await invoke<string>("forward_start", { forwardId: meta.forwardId });
+      if (destroyed || generation !== connectGeneration) {
+        await invoke("forward_stop", { activeId: startedId }).catch(() => {});
+        return;
+      }
+      activeId = startedId;
       status = "active";
-      startPolling();
+      await pollStats();
+      if (activeId === startedId && status === "active") startPolling();
     } catch (e: any) {
+      if (destroyed || generation !== connectGeneration) return;
       status = "error";
       errorMsg = errMsg(e);
     }
   }
 
-  async function stop() {
-    if (!activeId) return;
-    stopPolling();
+  async function toggleRule(rule: RuleStats) {
+    if (!activeId || rulePending[rule.index]) return;
+    const id = activeId;
+    const start = rule.status === "stopped" || rule.status === "error";
+    rulePending[rule.index] = true;
+    if (start) {
+      rules = rules.map((item) => item.index === rule.index
+        ? { ...item, status: "starting", error: null }
+        : item);
+    }
     try {
-      await invoke("forward_stop", { activeId });
-      status = "stopped";
-      activeId = null;
-    } catch (e: any) { errorMsg = errMsg(e); }
+      await invoke(start ? "forward_rule_start" : "forward_rule_stop", {
+        activeId: id,
+        ruleIndex: rule.index,
+      });
+      await pollStats();
+      errorMsg = "";
+    } catch (e: any) {
+      if (!destroyed && activeId === id) {
+        const message = errMsg(e);
+        errorMsg = message;
+        toast.error(message);
+        await pollStats();
+      }
+    } finally {
+      rulePending[rule.index] = false;
+    }
   }
 
-  function handleKeydown(e: KeyboardEvent) {
-    if ((status === "error" || status === "stopped") && e.key.length === 1) {
-      connect();
+  function ruleLabel(rule: RuleStats): string {
+    const port = rule.effective_port ?? (rule.rule.type === "remote" ? rule.rule.remote_port : rule.rule.local_port);
+    if (rule.rule.type === "dynamic") return `SOCKS5 127.0.0.1:${port}`;
+    if (rule.rule.type === "remote") return `remote:${port} → ${rule.rule.remote_host}:${rule.rule.local_port}`;
+    return `127.0.0.1:${port} → ${rule.rule.remote_host}:${rule.rule.remote_port}`;
+  }
+
+  function ruleType(rule: RuleStats): string {
+    return rule.rule.type === "local" ? "-L" : rule.rule.type === "remote" ? "-R" : "-D";
+  }
+
+  function ruleToggleLabel(rule: RuleStats): string {
+    const action = rule.status === "stopped" || rule.status === "error"
+      ? t("forward.start")
+      : t("forward.stop");
+    return `${action}: ${ruleLabel(rule)}`;
+  }
+
+  async function stop() {
+    if (!activeId) return;
+    const generation = ++stopGeneration;
+    const id = activeId;
+    status = "connecting";
+    stopPolling();
+    try {
+      await invoke("forward_stop", { activeId: id });
+      if (destroyed || generation !== stopGeneration) return;
+      status = "stopped";
+      if (activeId === id) activeId = null;
+    } catch (e: any) {
+      if (destroyed || generation !== stopGeneration) return;
+      errorMsg = errMsg(e);
+      status = "active";
+      startPolling();
     }
   }
 
   onDestroy(() => {
+    destroyed = true;
+    connectGeneration++;
+    stopGeneration++;
+    pollGeneration++;
     stopPolling();
-    if (activeId) invoke("forward_stop", { activeId }).catch(() => {});
+    const id = activeId;
+    activeId = null;
+    if (id) invoke("forward_stop", { activeId: id }).catch(() => {});
   });
 
-  const isRemote = $derived(meta.forwardType === "remote");
-  const isDynamic = $derived(meta.forwardType === "dynamic");
-  const dirLabel = $derived(isDynamic ? "SOCKS5" : isRemote ? "Remote" : "Local");
-  const arrow = $derived(
-    isDynamic ? `SOCKS5 proxy on localhost:${meta.localPort}`
-    : isRemote ? `remote:${meta.localPort} \u2192 localhost:${meta.remotePort}`
-    : `localhost:${meta.localPort} \u2192 ${meta.remoteHost}:${meta.remotePort}`);
+  const ruleCount = $derived(rules.length || Number(meta.ruleCount ?? "1"));
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
-
 <div class="forward-pane">
-  <div class="card surface-raised">
-    <div class="header">
-      <span class="type-badge" class:remote={isRemote}>{dirLabel}</span>
-      <h3>{meta.name ?? "Port Forward"}</h3>
-    </div>
-
-    <div class="route">{arrow}</div>
-    <div class="via">via {meta.profileName ?? meta.host}</div>
-
-    <div class="status-area">
-      {#if status === "connecting"}
-        <span class="indicator connecting"></span> <span class="status-text">Connecting...</span>
-      {:else if status === "active"}
-        <span class="indicator active"></span> <span class="status-text">Active</span>
-      {:else if status === "error"}
-        <span class="indicator error"></span> <span class="status-text">Error</span>
-      {:else}
-        <span class="indicator stopped"></span> <span class="status-text">Stopped</span>
-      {/if}
-    </div>
-
-    {#if status === "active"}
-      <div class="stats">
-        <div class="stat">
-          <span class="stat-label">Connections</span>
-          <span class="stat-value">{connections}</span>
+  <div class="forward-content">
+    <section class="card surface-raised summary-card">
+      <div class="summary-head">
+        <div class="header">
+          <span class="type-badge">SSH</span>
+          <div>
+            <h3>{meta.name ?? "Port Forward"}</h3>
+            <div class="summary-meta">
+              <span>{t("forward.rule_count", { count: ruleCount })}</span>
+              <span>{t("forward.via", { profile: meta.profileName ?? meta.host ?? "?" })}</span>
+            </div>
+          </div>
         </div>
-        <div class="stat">
-          <span class="stat-label">TX</span>
-          <span class="stat-value">{formatBytes(bytesTx)}</span>
-        </div>
-        <div class="stat">
-          <span class="stat-label">RX</span>
-          <span class="stat-value">{formatBytes(bytesRx)}</span>
+        <div class="status-area" role="status" aria-live="polite">
+          {#if status === "connecting"}
+            <span class="indicator connecting"></span> <span class="status-text">{t("common.connecting")}</span>
+          {:else if status === "active"}
+            <span class="indicator active"></span> <span class="status-text">{t("forward.status_active")}</span>
+          {:else if status === "error"}
+            <span class="indicator error"></span> <span class="status-text">{t("forward.status_error")}</span>
+          {:else}
+            <span class="indicator stopped"></span> <span class="status-text">{t("forward.status_stopped")}</span>
+          {/if}
         </div>
       </div>
-    {/if}
 
-    {#if errorMsg}
-      <div class="error-msg">{errorMsg}</div>
-    {/if}
+      <div class="stats summary-stats">
+        <div class="stat">
+          <span class="stat-label">{t("forward.active_connections")}</span>
+          <span class="stat-value">{connections}</span>
+        </div>
+        <div class="stat"><span class="stat-label">TX</span><span class="stat-value">{formatBytes(bytesTx)}</span></div>
+        <div class="stat"><span class="stat-label">RX</span><span class="stat-value">{formatBytes(bytesRx)}</span></div>
+      </div>
 
-    <div class="actions">
-      {#if status === "active"}
-        <button class="btn-stop" onclick={stop}>Stop</button>
-      {:else if status === "error" || status === "stopped"}
-        <button class="btn-reconnect" onclick={connect}>Reconnect</button>
-        <div class="hint">Press any key to reconnect</div>
-      {/if}
-    </div>
+      {#if errorMsg}<div class="error-msg" role="alert">{errorMsg}</div>{/if}
+
+      <div class="actions">
+        {#if status === "active"}
+          <button class="btn-stop" onclick={stop}>{t("forward.stop")}</button>
+        {:else if status === "error" || status === "stopped"}
+          <button class="btn-reconnect" onclick={connect}>{t("common.reconnect")}</button>
+        {/if}
+      </div>
+    </section>
+
+    {#if rules.length > 0}
+      <div class="rule-grid">
+        {#each rules as rule (rule.index)}
+          <article class="card surface-raised rule-card" class:rule-off={rule.status === "stopped"} class:rule-error={rule.status === "error" || rule.status === "stopping_error"}>
+            <div class="rule-head">
+              <span class="rule-type">{ruleType(rule)}</span>
+              <code>{ruleLabel(rule)}</code>
+              <label class="switch">
+                <input
+                  type="checkbox"
+                  aria-label={ruleToggleLabel(rule)}
+                  checked={rule.status === "active" || rule.status === "starting" || rule.status === "stopping_error"}
+                  disabled={rulePending[rule.index] || rule.status === "starting"}
+                  onchange={() => toggleRule(rule)}
+                />
+                <span class="slider"></span>
+              </label>
+            </div>
+            <div class="rule-status" role="status" aria-live="polite">
+              <span class="indicator" class:active={rule.status === "active"} class:connecting={rule.status === "starting"} class:error={rule.status === "error" || rule.status === "stopping_error"} class:stopped={rule.status === "stopped"}></span>
+              <span>{t(`forward.status_${rule.status}`)}</span>
+              {#if rule.error}<span class="rule-error-text">{errMsg(rule.error)}</span>{/if}
+            </div>
+            <div class="rule-stats">
+              <span>{t("forward.active_connections")} <b>{rule.connections}</b></span>
+              <span>TX <b>{formatBytes(rule.bytes_tx)}</b></span>
+              <span>RX <b>{formatBytes(rule.bytes_rx)}</b></span>
+            </div>
+          </article>
+        {/each}
+      </div>
+    {/if}
   </div>
 </div>
 
 <style>
   .forward-pane {
     height: 100%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    overflow: auto;
     padding: 24px;
   }
 
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--divider);
-    border-radius: 12px;
-    padding: calc(28px * var(--density)) calc(32px * var(--density));
-    min-width: 340px;
-    max-width: 420px;
+  .forward-content {
+    width: min(760px, 100%);
+    margin: 0 auto;
     display: flex;
     flex-direction: column;
-    gap: calc(12px * var(--density));
+    gap: 14px;
+  }
+
+  .summary-card, .rule-card {
+    padding: calc(18px * var(--density)) calc(20px * var(--density));
+  }
+
+  .summary-card {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .summary-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
   }
 
   .header {
@@ -192,31 +336,19 @@
     flex-shrink: 0;
   }
 
-  .type-badge.remote {
-    background: color-mix(in srgb, var(--magenta) 15%, transparent);
-    color: var(--magenta);
-  }
-
-  .route {
-    font-family: monospace;
-    font-size: 13px;
-    color: var(--text);
-    background: var(--bg);
-    padding: 8px 12px;
-    border-radius: 6px;
-    text-align: center;
-  }
-
-  .via {
-    font-size: 12px;
+  .summary-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 14px;
+    margin-top: 4px;
+    font-size: 11px;
     color: var(--text-sub);
-    text-align: center;
   }
 
   .status-area {
     display: flex;
     align-items: center;
-    justify-content: center;
+    justify-content: flex-end;
     gap: 8px;
     padding: 4px 0;
   }
@@ -274,6 +406,26 @@
     color: var(--text);
   }
 
+  .rule-grid { display: grid; gap: 12px; }
+  .rule-card {
+    border-left: 3px solid var(--success);
+  }
+  .rule-card.rule-off { border-left-color: var(--text-dim); opacity: 0.78; }
+  .rule-card.rule-error { border-left-color: var(--error); }
+  .rule-head { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; }
+  .rule-head code { color: var(--text); overflow-wrap: anywhere; }
+  .rule-type {
+    font: 700 11px monospace;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 3px;
+    padding: 2px 5px;
+  }
+  .rule-status { display: flex; align-items: center; gap: 6px; margin-top: 9px; font-size: 11px; color: var(--text-sub); }
+  .rule-error-text { color: var(--error); margin-left: auto; }
+  .rule-stats { display: flex; gap: 18px; margin-top: 8px; font: 10px monospace; color: var(--text-dim); }
+  .rule-stats b { color: var(--text); font-weight: 600; }
+
   .error-msg {
     font-size: 12px;
     color: var(--error);
@@ -312,8 +464,13 @@
     color: var(--bg);
   }
 
-  .hint {
-    font-size: 11px;
-    color: var(--text-dim);
+  @media (max-width: 600px) {
+    .forward-pane { padding: 12px; }
+    .summary-card, .rule-card { padding: 16px; }
+    .summary-head { align-items: stretch; flex-direction: column; }
+    .status-area { justify-content: flex-start; }
+    .rule-stats { flex-wrap: wrap; }
+    .rule-head { grid-template-columns: auto 1fr auto; }
   }
+
 </style>
