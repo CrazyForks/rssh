@@ -21,6 +21,15 @@
 import type { Terminal, ITheme, IBufferCell } from "@xterm/xterm";
 import type { CommandBlock } from "./command-blocks";
 import { resolveBlockLines, type FoldLookup } from "./block-content";
+import {
+  commandBlockPromptEnd,
+  compileCommandBlockRedaction,
+  promptReplacementForTail,
+  redactionRuleMatches,
+  type CommandBlockRedactionSettings,
+  type CompiledCommandBlockRedaction,
+  type CompiledCommandBlockRedactionRule,
+} from "./command-block-redaction";
 
 export interface RenderOptions {
   /** 彩色竖线宽度 px。默认 4。 */
@@ -46,6 +55,8 @@ export interface ImageCell {
 export interface ImageRow {
   blockId: number;
   blockColor: string;
+  /** xterm soft-wrap continuation; true means this row continues the previous. */
+  isWrapped: boolean;
   cells: ImageCell[];
 }
 
@@ -58,6 +69,7 @@ export async function renderBlocksToBlob(
   blocks: ReadonlyArray<CommandBlock>,
   opts: RenderOptions = {},
   foldStore?: FoldLookup,
+  redaction?: CommandBlockRedactionSettings,
 ): Promise<Blob | null> {
   if (blocks.length === 0) return null;
   // 非 DOM 环境（vitest node / SSR）→ null。否则下方 createElement 会 throw，
@@ -67,9 +79,187 @@ export async function renderBlocksToBlob(
   if (document.fonts?.ready) {
     await document.fonts.ready;
   }
-  const rows = extractImageRows(term, blocks, foldStore);
+  const extracted = extractImageRows(term, blocks, foldStore);
+  const rows = redaction ? redactImageRows(extracted, redaction) : extracted;
   if (rows.length === 0) return null;
   return renderRowsToBlob(rows, term, opts);
+}
+
+/* ───────────────────────── 脱敏（纯函数，可测） ───────────────────────── */
+
+function rowText(cells: ReadonlyArray<ImageCell>): string {
+  return cells.map((cell) => cell.ch).join("");
+}
+
+function graphemeWidth(ch: string): 1 | 2 {
+  const cp = ch.codePointAt(0) ?? 0;
+  // Same broad East-Asian/emoji ranges used by terminal wcwidth tables. The
+  // Prompt replacement defaults to ASCII; this keeps user-supplied CJK or
+  // emoji replacements aligned without dragging a second width library in.
+  const wide = cp >= 0x1100 && (
+    cp <= 0x115f || cp === 0x2329 || cp === 0x232a ||
+    (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe10 && cp <= 0xfe19) ||
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1faff) ||
+    (cp >= 0x20000 && cp <= 0x3fffd)
+  );
+  return wide ? 2 : 1;
+}
+
+function cellsFromText(text: string, style: ImageCell): ImageCell[] {
+  return Array.from(text, (ch) => ({ ...style, ch, width: graphemeWidth(ch) }));
+}
+
+function styleAt(cells: ReadonlyArray<ImageCell>, offset: number): ImageCell | null {
+  let cursor = 0;
+  for (const cell of cells) {
+    const end = cursor + cell.ch.length;
+    if (offset < end) return cell;
+    cursor = end;
+  }
+  return cells[cells.length - 1] ?? null;
+}
+
+/** Slice by UTF-16 text offsets while retaining cell styling. xterm normally
+ *  stores one grapheme per cell, but partial slicing is handled as well. */
+function sliceCells(
+  cells: ReadonlyArray<ImageCell>,
+  start: number,
+  end: number,
+): ImageCell[] {
+  if (start >= end) return [];
+  const out: ImageCell[] = [];
+  let cursor = 0;
+  for (const cell of cells) {
+    const cellEnd = cursor + cell.ch.length;
+    if (cellEnd <= start) {
+      cursor = cellEnd;
+      continue;
+    }
+    if (cursor >= end) break;
+    const from = Math.max(0, start - cursor);
+    const to = Math.min(cell.ch.length, end - cursor);
+    const ch = cell.ch.slice(from, to);
+    if (ch) {
+      out.push(from === 0 && to === cell.ch.length
+        ? { ...cell }
+        : { ...cell, ch, width: graphemeWidth(ch) });
+    }
+    cursor = cellEnd;
+  }
+  return out;
+}
+
+function applyRule(
+  cells: ReadonlyArray<ImageCell>,
+  rule: CompiledCommandBlockRedactionRule,
+): ImageCell[] {
+  const text = rowText(cells);
+  const matches = redactionRuleMatches(text, rule);
+  if (matches.length === 0) return cells.map((cell) => ({ ...cell }));
+
+  const out: ImageCell[] = [];
+  let cursor = 0;
+  for (const match of matches) {
+    out.push(...sliceCells(cells, cursor, match.start));
+    const style = styleAt(cells, match.start);
+    if (style) out.push(...cellsFromText(rule.replacement, style));
+    cursor = match.end;
+  }
+  out.push(...sliceCells(cells, cursor, text.length));
+  return out;
+}
+
+function applyRules(
+  cells: ReadonlyArray<ImageCell>,
+  rules: ReadonlyArray<CompiledCommandBlockRedactionRule>,
+): ImageCell[] {
+  return rules.reduce<ImageCell[]>((current, rule) => applyRule(current, rule), [...cells]);
+}
+
+function redactWrappedPromptRows(
+  rows: ReadonlyArray<ImageRow>,
+  promptEnd: number,
+  redaction: CompiledCommandBlockRedaction,
+): ImageRow[] {
+  const promptStyle = styleAt(rows[0].cells, 0);
+  let remaining = promptEnd;
+
+  return rows.map((row, index) => {
+    if (remaining === 0) {
+      return { ...row, cells: applyRules(row.cells, redaction.rules) };
+    }
+
+    const text = rowText(row.cells);
+    const consumed = Math.min(remaining, text.length);
+    remaining -= consumed;
+    const tail = applyRules(
+      sliceCells(row.cells, consumed, text.length),
+      redaction.rules,
+    );
+    if (index !== 0) return { ...row, cells: tail };
+
+    const replacement = promptReplacementForTail(
+      redaction.promptReplacement,
+      remaining === 0 ? rowText(tail) : "",
+    );
+    return {
+      ...row,
+      cells: [
+        ...(promptStyle ? cellsFromText(replacement, promptStyle) : []),
+        ...tail,
+      ],
+    };
+  });
+}
+
+export function redactImageRows(
+  rows: ReadonlyArray<ImageRow>,
+  settings: CommandBlockRedactionSettings,
+): ImageRow[] {
+  const redaction = compileCommandBlockRedaction(settings);
+  const seenBlocks = new Set<number>();
+  const out: ImageRow[] = [];
+  let index = 0;
+
+  while (index < rows.length) {
+    const row = rows[index];
+    const firstRow = !seenBlocks.has(row.blockId);
+    seenBlocks.add(row.blockId);
+    if (!firstRow) {
+      out.push({ ...row, cells: applyRules(row.cells, redaction.rules) });
+      index++;
+      continue;
+    }
+
+    let logicalEnd = index + 1;
+    while (
+      logicalEnd < rows.length &&
+      rows[logicalEnd].blockId === row.blockId &&
+      rows[logicalEnd].isWrapped
+    ) {
+      logicalEnd++;
+    }
+    const logicalRows = rows.slice(index, logicalEnd);
+    const logicalText = logicalRows.map((item) => rowText(item.cells)).join("");
+    const promptEnd = commandBlockPromptEnd(logicalText, true, redaction);
+    if (promptEnd === null) {
+      out.push(...logicalRows.map((item) => ({
+        ...item,
+        cells: applyRules(item.cells, redaction.rules),
+      })));
+    } else {
+      out.push(...redactWrappedPromptRows(logicalRows, promptEnd, redaction));
+    }
+    index = logicalEnd;
+  }
+
+  return out;
 }
 
 /* ───────────────────────── 数据抽取（纯函数，可测） ───────────────────────── */
@@ -103,7 +293,12 @@ export function extractImageRows(
         if (last.ch === " " && last.bg === defaultBg(theme)) cells.pop();
         else break;
       }
-      out.push({ blockId: block.id, blockColor: block.color, cells });
+      out.push({
+        blockId: block.id,
+        blockColor: block.color,
+        isWrapped: line.isWrapped,
+        cells,
+      });
     }
   }
   return out;
